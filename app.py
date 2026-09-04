@@ -55,6 +55,11 @@ _bootstrap_env()
 from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
 from tradingagents.graph.trading_graph import TradingAgentsGraph  # noqa: E402
 
+try:
+    from report_docx import markdown_to_docx
+except Exception:  # python-docx ausente ou módulo não encontrado
+    markdown_to_docx = None
+
 
 # ---------------------------------------------------------------------------
 # Estado
@@ -245,16 +250,40 @@ if st.session_state.runs:
     # Download ----------------------------------------------------------------
     markdown = build_markdown(selected, result)
     tk, dt = selected.split("|")
-    st.download_button(
-        "Baixar relatório completo (.md)",
-        data=markdown.encode("utf-8"),
-        file_name=f"tradingagents_{tk.replace('.', '_')}_{dt}.md",
-        mime="text/markdown",
-        type="primary",
-    )
+    base_name = f"tradingagents_{tk.replace('.', '_')}_{dt}"
+
+    col_md, col_doc = st.columns(2)
+    with col_md:
+        st.download_button(
+            "Baixar em Markdown (.md)",
+            data=markdown.encode("utf-8"),
+            file_name=f"{base_name}.md",
+            mime="text/markdown",
+        )
+    with col_doc:
+        if markdown_to_docx is None:
+            st.button("Baixar em Word (.docx)", disabled=True)
+            st.caption("Requer python-docx e o arquivo report_docx.py na raiz.")
+        else:
+            try:
+                docx_bytes = markdown_to_docx(markdown)
+                st.download_button(
+                    "Baixar em Word (.docx)",
+                    data=docx_bytes,
+                    file_name=f"{base_name}.docx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument"
+                        ".wordprocessingml.document"
+                    ),
+                    type="primary",
+                )
+            except Exception as exc:
+                st.button("Baixar em Word (.docx)", disabled=True)
+                st.caption(f"Falha ao montar o documento: {exc}")
+
     st.caption(
-        "Markdown abre em qualquer editor e no Obsidian/Notion. "
-        "Para PDF, imprima a partir do navegador."
+        "O Word sai formatado com capa, sumário, cabeçalho e numeração. "
+        "O Markdown é o texto cru, para editar ou arquivar em texto."
     )
 
     # Decisão -----------------------------------------------------------------
