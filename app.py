@@ -9,7 +9,7 @@ tradingagents/. Rodar com:
 
 import os
 import traceback
-from datetime import date
+from datetime import date, datetime
 
 import streamlit as st
 
@@ -171,7 +171,15 @@ if run:
             st.write("Rodando analistas, debate e comitê de risco")
             state, decision = graph.propagate(ticker, analysis_date.isoformat())
 
-            st.session_state.runs[run_key] = {"state": state, "decision": decision}
+            st.session_state.runs[run_key] = {
+                "state": state,
+                "decision": decision,
+                "provider": provider,
+                "deep_model": deep_model,
+                "quick_model": quick_model,
+                "benchmark": benchmark,
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+            }
             st.session_state.last_key = run_key
             status.update(label=f"{ticker} concluído", state="complete")
         except Exception as exc:
@@ -181,11 +189,41 @@ if run:
 
 
 # ---------------------------------------------------------------------------
+# Montagem do relatório em markdown
+# ---------------------------------------------------------------------------
+
+def build_markdown(key, result):
+    ticker_part, date_part = key.split("|")
+    lines = [
+        f"# TradingAgents — {ticker_part}",
+        "",
+        f"- Data da análise: {date_part}",
+        f"- Gerado em: {result.get('finished_at', '')}",
+        f"- Provedor: {result.get('provider', '')}",
+        f"- Modelo de raciocínio: {result.get('deep_model', '')}",
+        f"- Modelo rápido: {result.get('quick_model', '')}",
+    ]
+    if result.get("benchmark"):
+        lines.append(f"- Benchmark: {result['benchmark']}")
+
+    lines += ["", "---", "", "## Decisão final", "", str(result.get("decision", "")), ""]
+
+    state = result.get("state")
+    if isinstance(state, dict):
+        for k, v in state.items():
+            if isinstance(v, str) and v.strip():
+                title = k.replace("_", " ").strip().capitalize()
+                lines += ["---", "", f"## {title}", "", v, ""]
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Resultado
 #
 # Mostra sempre a última análise concluída, e não a que corresponde aos
-# campos atuais. Mexer no ticker ou na data depois de rodar não faz mais
-# o resultado sumir da tela.
+# campos atuais. Mexer no ticker ou na data depois de rodar não faz o
+# resultado sumir da tela.
 # ---------------------------------------------------------------------------
 
 if st.session_state.runs:
@@ -204,6 +242,22 @@ if st.session_state.runs:
     decision = result["decision"]
     state = result["state"]
 
+    # Download ----------------------------------------------------------------
+    markdown = build_markdown(selected, result)
+    tk, dt = selected.split("|")
+    st.download_button(
+        "Baixar relatório completo (.md)",
+        data=markdown.encode("utf-8"),
+        file_name=f"tradingagents_{tk.replace('.', '_')}_{dt}.md",
+        mime="text/markdown",
+        type="primary",
+    )
+    st.caption(
+        "Markdown abre em qualquer editor e no Obsidian/Notion. "
+        "Para PDF, imprima a partir do navegador."
+    )
+
+    # Decisão -----------------------------------------------------------------
     st.subheader("Decisão")
     if decision is None or (isinstance(decision, str) and not decision.strip()):
         st.warning("A execução terminou sem produzir uma decisão legível.")
@@ -215,8 +269,7 @@ if st.session_state.runs:
         st.write(decision)
         st.caption(f"Tipo retornado: {type(decision).__name__}")
 
-    # O primeiro retorno de .propagate() é o estado final do grafo.
-    # Os nomes das chaves variam entre versões — daí a varredura.
+    # Relatórios --------------------------------------------------------------
     if isinstance(state, dict):
         text_keys = [
             k for k, v in state.items()
@@ -237,25 +290,48 @@ if st.session_state.runs:
             st.write(state)
             st.caption(f"Tipo: {type(state).__name__}")
 
-    # -----------------------------------------------------------------------
-    # Reflexão
-    # -----------------------------------------------------------------------
-
+    # Reflexão ----------------------------------------------------------------
+    # O nome do método mudou entre versões (o main.py ainda cita
+    # reflect_and_remember, que não existe mais em 0.4.0). Procura os
+    # candidatos conhecidos e mostra o que a classe realmente oferece.
     st.divider()
     st.subheader("Registrar resultado")
-    st.caption(
-        "Depois que a posição fechar, informe o retorno realizado. "
-        "É isso que alimenta a reflexão usada nas próximas análises."
+
+    REFLECT_CANDIDATES = (
+        "reflect_and_remember",
+        "reflect",
+        "reflect_on_decision",
+        "remember",
+        "update_memory",
     )
-    returns = st.number_input("Retorno da posição", value=0.0, step=100.0)
-    if st.button("Salvar reflexão"):
-        try:
-            graph = TradingAgentsGraph(debug=debug_mode, config=build_config())
-            graph.reflect_and_remember(returns)
-            st.success("Reflexão registrada no histórico.")
-        except Exception as exc:
-            st.error(f"{type(exc).__name__}: {exc}")
-            st.code(traceback.format_exc())
+    available = [m for m in REFLECT_CANDIDATES if hasattr(TradingAgentsGraph, m)]
+
+    if available:
+        st.caption(
+            "Depois que a posição fechar, informe o retorno realizado. "
+            "É isso que alimenta a reflexão usada nas próximas análises."
+        )
+        method_name = available[0] if len(available) == 1 else st.selectbox(
+            "Método", available
+        )
+        returns = st.number_input("Retorno da posição", value=0.0, step=100.0)
+        if st.button("Salvar reflexão"):
+            try:
+                graph = TradingAgentsGraph(debug=debug_mode, config=build_config())
+                getattr(graph, method_name)(returns)
+                st.success("Reflexão registrada no histórico.")
+            except Exception as exc:
+                st.error(f"{type(exc).__name__}: {exc}")
+                st.code(traceback.format_exc())
+    else:
+        st.info(
+            "Esta versão do TradingAgents não expõe um método público de reflexão. "
+            "O registro de decisões roda sozinho ao final de cada análise, "
+            "gravado em "
+            f"`{os.environ.get('TRADINGAGENTS_MEMORY_LOG_PATH')}`."
+        )
+        with st.expander("Métodos públicos disponíveis na classe"):
+            st.write([m for m in dir(TradingAgentsGraph) if not m.startswith("_")])
 
 else:
     st.info("Configure o provedor na barra lateral e rode uma análise.")
