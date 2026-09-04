@@ -1,13 +1,14 @@
 """
 Streamlit wrapper para o TradingAgents.
 
-Fica no lugar do pacote `cli/`: chama `tradingagents` direto, sem passar
-pelo terminal. Rode com:
+Colocar na raiz do repositório, no mesmo nível de main.py e da pasta
+tradingagents/. Rodar com:
 
     streamlit run app.py
 """
 
 import os
+import traceback
 from datetime import date
 
 import streamlit as st
@@ -20,16 +21,25 @@ st.set_page_config(page_title="TradingAgents", page_icon="📊", layout="wide")
 # DEFAULT_CONFIG lê as env vars no momento do import do módulo.
 # ---------------------------------------------------------------------------
 
+ENV_BY_PROVIDER = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "ollama": None,  # local, sem chave
+}
+
+
 def _bootstrap_env():
-    """Carrega chaves de st.secrets (deploy) ou do ambiente local."""
-    for key in (
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GOOGLE_API_KEY",
-        "FRED_API_KEY",
-    ):
-        if key in st.secrets and not os.environ.get(key):
-            os.environ[key] = st.secrets[key]
+    """Carrega chaves de st.secrets (se existirem) e fixa caminhos de dados."""
+    try:
+        secrets = st.secrets
+    except Exception:
+        secrets = {}
+
+    for key in list(ENV_BY_PROVIDER.values()) + ["FRED_API_KEY"]:
+        if key and key in secrets and not os.environ.get(key):
+            os.environ[key] = secrets[key]
 
     # Disco no Streamlit Cloud é efêmero. Aponte para algo persistente
     # se quiser manter o histórico de decisões entre reinícios.
@@ -51,7 +61,9 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph  # noqa: E402
 # ---------------------------------------------------------------------------
 
 if "runs" not in st.session_state:
-    st.session_state.runs = {}  # chave "TICKER|data" -> {"state":..., "decision":...}
+    st.session_state.runs = {}     # "TICKER|data" -> {"state":..., "decision":...}
+if "last_key" not in st.session_state:
+    st.session_state.last_key = None   # última análise concluída
 
 
 # ---------------------------------------------------------------------------
@@ -61,17 +73,23 @@ if "runs" not in st.session_state:
 with st.sidebar:
     st.header("Configuração")
 
-    api_key = st.text_input(
-        "Chave da API",
-        type="password",
-        value=os.environ.get("OPENAI_API_KEY", ""),
-        help="Usada só nesta sessão. Não é gravada em lugar nenhum.",
-    )
-
     provider = st.selectbox(
         "Provedor",
-        ["openai", "anthropic", "google", "deepseek", "ollama"],
+        list(ENV_BY_PROVIDER.keys()),
     )
+
+    env_var = ENV_BY_PROVIDER[provider]
+
+    if env_var:
+        api_key = st.text_input(
+            f"Chave ({env_var})",
+            type="password",
+            value=os.environ.get(env_var, ""),
+            help="Usada só nesta sessão. Não é gravada em lugar nenhum.",
+        )
+    else:
+        api_key = ""
+        st.caption("Ollama roda local, sem chave.")
 
     deep_model = st.text_input("Modelo de raciocínio", DEFAULT_CONFIG["deep_think_llm"])
     quick_model = st.text_input("Modelo rápido", DEFAULT_CONFIG["quick_think_llm"])
@@ -80,6 +98,12 @@ with st.sidebar:
     risk_rounds = st.slider("Rodadas de risco", 1, 4, DEFAULT_CONFIG["max_risk_discuss_rounds"])
 
     language = st.selectbox("Idioma dos relatórios", ["Portuguese", "English"])
+
+    debug_mode = st.checkbox(
+        "Modo debug",
+        value=True,
+        help="Imprime o progresso no terminal onde você rodou o streamlit.",
+    )
 
     st.divider()
     st.caption(
@@ -112,7 +136,8 @@ with col_c:
         help="Deixe vazio para o projeto escolher pelo sufixo do ticker.",
     ).strip()
 
-run = st.button("Rodar análise", type="primary", disabled=not (ticker and api_key))
+can_run = bool(ticker) and (bool(api_key) or provider == "ollama")
+run = st.button("Rodar análise", type="primary", disabled=not can_run)
 
 
 # ---------------------------------------------------------------------------
@@ -133,49 +158,88 @@ def build_config():
 
 
 if run:
-    os.environ["OPENAI_API_KEY"] = api_key  # ajuste conforme o provedor
+    if env_var and api_key:
+        os.environ[env_var] = api_key
 
     run_key = f"{ticker}|{analysis_date.isoformat()}"
 
     with st.status(f"Analisando {ticker}…", expanded=True) as status:
         try:
             st.write("Montando o grafo de agentes")
-            graph = TradingAgentsGraph(debug=False, config=build_config())
+            graph = TradingAgentsGraph(debug=debug_mode, config=build_config())
 
             st.write("Rodando analistas, debate e comitê de risco")
             state, decision = graph.propagate(ticker, analysis_date.isoformat())
 
             st.session_state.runs[run_key] = {"state": state, "decision": decision}
+            st.session_state.last_key = run_key
             status.update(label=f"{ticker} concluído", state="complete")
         except Exception as exc:
             status.update(label="Falhou", state="error")
-            st.exception(exc)
+            st.error(f"{type(exc).__name__}: {exc}")
+            st.code(traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------
 # Resultado
+#
+# Mostra sempre a última análise concluída, e não a que corresponde aos
+# campos atuais. Mexer no ticker ou na data depois de rodar não faz mais
+# o resultado sumir da tela.
 # ---------------------------------------------------------------------------
 
-run_key = f"{ticker}|{analysis_date.isoformat()}"
-result = st.session_state.runs.get(run_key)
+if st.session_state.runs:
+    keys = list(st.session_state.runs.keys())
+    default_index = keys.index(st.session_state.last_key) if st.session_state.last_key in keys else 0
 
-if result:
-    st.subheader("Decisão")
-    st.write(result["decision"])
+    st.divider()
+    selected = st.selectbox(
+        "Análise",
+        keys,
+        index=default_index,
+        format_func=lambda k: k.replace("|", "  ·  "),
+    )
 
+    result = st.session_state.runs[selected]
+    decision = result["decision"]
     state = result["state"]
 
+    st.subheader("Decisão")
+    if decision is None or (isinstance(decision, str) and not decision.strip()):
+        st.warning("A execução terminou sem produzir uma decisão legível.")
+    elif isinstance(decision, str):
+        st.markdown(decision)
+    elif isinstance(decision, dict):
+        st.json(decision)
+    else:
+        st.write(decision)
+        st.caption(f"Tipo retornado: {type(decision).__name__}")
+
     # O primeiro retorno de .propagate() é o estado final do grafo.
-    # Os nomes das chaves podem mudar entre versões — daí a varredura.
+    # Os nomes das chaves variam entre versões — daí a varredura.
     if isinstance(state, dict):
-        report_keys = [k for k in state if "report" in k.lower() or "state" in k.lower()]
-        if report_keys:
+        text_keys = [
+            k for k, v in state.items()
+            if isinstance(v, str) and v.strip() and k != "decision"
+        ]
+        if text_keys:
             st.subheader("Relatórios por agente")
-            for key in report_keys:
+            for key in text_keys:
                 with st.expander(key.replace("_", " ")):
-                    st.write(state[key])
-        with st.expander("Estado bruto"):
-            st.json(state, expanded=False)
+                    st.markdown(state[key])
+
+        other_keys = [k for k in state if k not in text_keys]
+        if other_keys:
+            with st.expander("Demais campos do estado"):
+                st.write({k: state[k] for k in other_keys})
+    elif state is not None:
+        with st.expander("Estado retornado"):
+            st.write(state)
+            st.caption(f"Tipo: {type(state).__name__}")
+
+    # -----------------------------------------------------------------------
+    # Reflexão
+    # -----------------------------------------------------------------------
 
     st.divider()
     st.subheader("Registrar resultado")
@@ -186,15 +250,24 @@ if result:
     returns = st.number_input("Retorno da posição", value=0.0, step=100.0)
     if st.button("Salvar reflexão"):
         try:
-            graph = TradingAgentsGraph(debug=False, config=build_config())
+            graph = TradingAgentsGraph(debug=debug_mode, config=build_config())
             graph.reflect_and_remember(returns)
             st.success("Reflexão registrada no histórico.")
         except Exception as exc:
-            st.exception(exc)
+            st.error(f"{type(exc).__name__}: {exc}")
+            st.code(traceback.format_exc())
 
-if st.session_state.runs:
-    with st.sidebar:
-        st.divider()
-        st.caption("Análises nesta sessão")
-        for key in st.session_state.runs:
-            st.write(key.replace("|", " · "))
+else:
+    st.info("Configure o provedor na barra lateral e rode uma análise.")
+
+
+# ---------------------------------------------------------------------------
+# Diagnóstico
+# ---------------------------------------------------------------------------
+
+with st.expander("Diagnóstico"):
+    st.write("Análises em memória:", list(st.session_state.runs.keys()))
+    st.write("Última concluída:", st.session_state.last_key)
+    st.write("Provedor:", provider, "· variável:", env_var)
+    st.write("Chave presente no ambiente:", bool(env_var and os.environ.get(env_var)))
+    st.write("Caminho da memória:", os.environ.get("TRADINGAGENTS_MEMORY_LOG_PATH"))
